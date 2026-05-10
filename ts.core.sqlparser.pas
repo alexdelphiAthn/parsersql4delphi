@@ -267,6 +267,20 @@ implementation
 uses
   TypInfo;
 
+type
+  TSQLStartTransactionStatement = class(TSQLElement)
+  public
+    Modifiers: string;
+    function GetAsSQL(Options: TSQLFormatOptions; AIndent: Integer = 0): TSQLStringType; override;
+  end;
+
+function TSQLStartTransactionStatement.GetAsSQL(Options: TSQLFormatOptions; AIndent: Integer = 0): TSQLStringType;
+begin
+  Result := 'START TRANSACTION';
+  if Modifiers <> '' then
+    Result := Result + ' ' + Modifiers;
+end;
+
 Resourcestring
   SerrUnmatchedBrace = 'Expected ).';
   SErrUnexpectedToken = 'Unexpected token: %s';
@@ -1029,6 +1043,12 @@ begin
   C := TSQLCreateTableStatement(CreateElement(TSQLCreateTableStatement,
     AParent));
   try
+    if CurrentToken = tsqlIf then
+    begin
+      GetNextToken; // Pasamos 'IF'
+      if CurrentToken = tsqlNot then GetNextToken; // Pasamos 'NOT'
+      if CurrentToken = tsqlExists then GetNextToken; // Pasamos 'EXISTS'
+    end;
     Expect(tsqlIdentifier);
     C.ObjectName := CreateIdentifier(C, CurrentTokenString);
     GetNextToken;
@@ -1366,27 +1386,53 @@ begin
 end;
 
 function TSQLParser.ParseIfStatement(AParent : TSQLElement) : TSQLIFStatement;
+var
+  HasBrace: Boolean;
+  Block: TSQLStatementBlock;
 begin
-  // On Entry, we're on the if token
   Consume(tsqlIf);
-  Consume(tsqlBraceOpen);
+  HasBrace := (CurrentToken = tsqlBraceOpen);
+  if HasBrace then Consume(tsqlBraceOpen);
   Result := TSQLIFStatement(CreateElement(TSQLIFStatement, AParent));
   try
     Result.Condition := ParseExprLevel1(AParent, [eoIF]);
-    Consume(tsqlBraceClose);
+    if HasBrace then Consume(tsqlBraceClose);
     Consume(tsqlThen);
-    Result.TrueBranch := ParseProcedureStatement(Result);
-    if (CurrentToken = tsqlSemicolon) and (PeekNextToken = tsqlElse) then
+    if CurrentToken <> tsqlBegin then
     begin
-      GetNextToken;
+      Block := TSQLStatementBlock(CreateElement(TSQLStatementBlock, Result));
+      while not (CurrentToken in [tsqlElse, tsqlEnd, tsqlEOF]) do
+      begin
+         Block.Statements.Add(ParseProcedureStatement(Block));
+         if CurrentToken = tsqlSemicolon then Consume(tsqlSemicolon);
+      end;
+      Result.TrueBranch := Block;
     end
-    else if (CurrentToken = tsqlElse) then
-      if not(PreviousToken = tsqlEnd) then
-        UnexpectedToken;
-    if CurrentToken = tsqlElse then
+    else
+      Result.TrueBranch := ParseProcedureStatement(Result);
+    if (CurrentToken = tsqlElse) then
     begin
       GetNextToken;
-      Result.FalseBranch := ParseProcedureStatement(Result);
+      if CurrentToken <> tsqlBegin then
+      begin
+        Block := TSQLStatementBlock(CreateElement(TSQLStatementBlock, Result));
+        while not (CurrentToken in [tsqlEnd, tsqlEOF]) do
+        begin
+           Block.Statements.Add(ParseProcedureStatement(Block));
+           if CurrentToken = tsqlSemicolon then Consume(tsqlSemicolon);
+        end;
+        Result.FalseBranch := Block;
+      end
+      else
+        Result.FalseBranch := ParseProcedureStatement(Result);
+    end;
+    if (CurrentToken = tsqlEnd) then
+    begin
+      if (PeekNextToken = tsqlIf) then
+      begin
+        GetNextToken; // Consume END
+        GetNextToken; // Consume IF
+      end;
     end;
   except
     FreeAndNil(Result);
@@ -2892,9 +2938,12 @@ begin
             CreateIdentifier(Result, N);
           Consume(tsqlIdentifier);
         end;
-      tsqlIdentifier:
+      tsqlIdentifier, tsqlIf:
         begin
-          N := CurrentTokenString;
+          if CurrentToken = tsqlIf then
+            N := 'IF'
+          else
+            N := CurrentTokenString;
           if (GetNextToken <> tsqlBraceOpen) then
           begin
             if (eoCheckConstraint in EO) and not(eoTableConstraint in EO) then
@@ -3420,14 +3469,34 @@ end;
 
 function TSQLParser.ParseCreateStatement(AParent: TSQLElement; IsAlter: Boolean
   ): TSQLCreateOrAlterStatement;
+var
+  Tk: TSQLToken;
 begin
-  case GetNextToken of
+  Tk := GetNextToken;
+  if Tk = tsqlOr then
+  begin
+    GetNextToken;
+    Tk := GetNextToken;
+  end;
+  if (Tk = tsqlIdentifier) and
+     (SameText(CurrentTokenString, 'ALGORITHM') or
+      SameText(CurrentTokenString, 'DEFINER') or
+      SameText(CurrentTokenString, 'SQL')) then
+  begin
+    while not (PeekNextToken in [tsqlTable, tsqlView, tsqlProcedure,
+                                 tsqlTrigger, tsqlIndex, tsqlDomain, tsqlRole,
+                                 tsqlDatabase, tsqlEOF]) do
+    begin
+      GetNextToken;
+    end;
+    Tk := GetNextToken;
+  end;
+  case Tk of
     tsqlTable :
       if IsAlter then
         Result := ParseAlterTableStatement(AParent)
       else
         Result := ParseCreateTableStatement(AParent);
-
     tsqlUnique,
       tsqlAscending,
       tsqlDescending,
@@ -3505,6 +3574,12 @@ begin
     Error(SErrExpectedDBObject, [CurrentTokenString]);
   end;
   GetNextToken;
+  if CurrentToken = tsqlIf then
+  begin
+    GetNextToken;
+    if CurrentToken = tsqlExists then
+      GetNextToken;
+  end;
   if C = TSQLDropShadowStatement then
     Expect(tsqlIntegerNumber)
   else
@@ -4191,13 +4266,8 @@ end;
 function TSQLParser.Parse: TSQLElement;
 begin
   GetNextToken;
-
-  // 1. Limpiar puntos y comas vacíos o caracteres sueltos al final
   while CurrentToken = tsqlSemicolon do
     GetNextToken;
-
-  // 2. LA VALIDACIÓN DEBE IR EXACTAMENTE AQUÍ (ANTES DEL CASE)
-  // Añadimos tsqlUnknown por si el string termina con saltos de línea invisibles
   while CurrentToken in [tsqlSemicolon,
                          tsqlWhiteSpace,
                          tsqlComment,
@@ -4205,7 +4275,6 @@ begin
     GetNextToken;
   if CurrentToken = tsqlEOF then
     Exit(nil);
-  // 3. Inicio del Case
   case CurrentToken of
     tsqlSelect, tsqlWith :
       Result := ParseSelectStatement(nil, []);
@@ -4236,10 +4305,38 @@ begin
       Result := ParseGrantStatement(nil);
     tsqlRevoke :
       Result := ParseRevokeStatement(nil);
-  else
-    UnexpectedToken; // Si la validación estuviera después del case, fallaría aquí.
-  end;
+    tsqlIdentifier:
+      begin
+        if SameText(CurrentTokenString, 'START') then
+        begin
+          GetNextToken; // Pasamos el token 'START'
+          if (CurrentToken = tsqlTransaction) or
+             SameText(CurrentTokenString, 'TRANSACTION') then
+          begin
+            Result := TSQLStartTransactionStatement(CreateElement(
+                                           TSQLStartTransactionStatement, nil));
+            GetNextToken; // Pasamos 'TRANSACTION'
+            while not (CurrentToken in [tsqlEOF, tsqlSemicolon]) do
+            begin
+              if TSQLStartTransactionStatement(Result).Modifiers <> '' then
+                TSQLStartTransactionStatement(Result).Modifiers :=
+                          TSQLStartTransactionStatement(Result).Modifiers + ' ';
 
+              TSQLStartTransactionStatement(Result).Modifiers :=
+                               TSQLStartTransactionStatement(Result).Modifiers +
+                                                             CurrentTokenString;
+              GetNextToken;
+            end;
+          end
+          else
+            UnexpectedToken;
+        end
+        else
+          UnexpectedToken;
+      end;
+  else
+    UnexpectedToken;
+  end;
   if Not(CurrentToken in [tsqlEOF, tsqlSemicolon]) then
   begin
     FreeAndNil(Result);
