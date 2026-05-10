@@ -271,7 +271,17 @@ type
   TSQLStartTransactionStatement = class(TSQLElement)
   public
     Modifiers: string;
-    function GetAsSQL(Options: TSQLFormatOptions; AIndent: Integer = 0): TSQLStringType; override;
+    function GetAsSQL(Options: TSQLFormatOptions;
+                      AIndent: Integer = 0): TSQLStringType; override;
+  end;
+
+  TSQLMariaDBInsertStatement = class(TSQLInsertStatement)
+  public
+    ExtraValues: string;
+    OnDuplicateKey: string;
+    IsReplace: Boolean;
+    function GetAsSQL(Options: TSQLFormatOptions;
+                      AIndent: Integer = 0): TSQLStringType; override;
   end;
 
 function TSQLStartTransactionStatement.GetAsSQL(Options: TSQLFormatOptions; AIndent: Integer = 0): TSQLStringType;
@@ -867,14 +877,27 @@ begin
   end;
 end;
 
-function TSQLParser.ParseInsertStatement(AParent: TSQLElement)
-  : TSQLInsertStatement;
+function TSQLParser.ParseInsertStatement(AParent: TSQLElement): TSQLInsertStatement;
+var
+  MDBInsert: TSQLMariaDBInsertStatement;
+  PCount: Integer;
+  IsReplaceStmt: Boolean;
 begin
-  // On entry, we're on the INSERT statement
-  Consume(tsqlInsert);
+  IsReplaceStmt := False;
+  if SameText(CurrentTokenString, 'REPLACE') then
+  begin
+    IsReplaceStmt := True;
+    GetNextToken;
+  end
+  else
+    Consume(tsqlInsert);
+  if (CurrentToken = tsqlIdentifier) and SameText(CurrentTokenString, 'IGNORE') then
+    GetNextToken;
   Consume(tsqlInto);
   Expect(tsqlIdentifier);
-  Result := TSQLInsertStatement(CreateElement(TSQLInsertStatement, AParent));
+  MDBInsert := TSQLMariaDBInsertStatement(CreateElement(TSQLMariaDBInsertStatement, AParent));
+  MDBInsert.IsReplace := IsReplaceStmt; // Guardamos si era un REPLACE
+  Result := MDBInsert;
   try
     Result.TableName := CreateIdentifier(Result, CurrentTokenString);
     GetNextToken;
@@ -897,10 +920,69 @@ begin
         begin
           GetNextToken;
           Result.Values := ParseValueList(Result, [eoFieldValue]);
-          GetNextToken; // consume )
+          GetNextToken; // consume el primer ')'
+          while CurrentToken = tsqlComma do
+          begin
+            MDBInsert.ExtraValues := MDBInsert.ExtraValues + ',' + sLineBreak + '  (';
+            GetNextToken; // Consumimos la coma
+            Expect(tsqlBraceOpen);
+            PCount := 1;
+            GetNextToken; // Consumimos el '('
+            while (PCount > 0) and (CurrentToken <> tsqlEOF) do
+            begin
+              if CurrentToken = tsqlBraceOpen then Inc(PCount)
+              else if CurrentToken = tsqlBraceClose then Dec(PCount);
+              if PCount > 0 then
+              begin
+                if CurrentToken = tsqlString then
+                  MDBInsert.ExtraValues := MDBInsert.ExtraValues + '''' + CurrentTokenString + ''''
+                else
+                  MDBInsert.ExtraValues := MDBInsert.ExtraValues + CurrentTokenString;
+                GetNextToken;
+                if not (CurrentToken in [tsqlComma, tsqlBraceClose, tsqlBraceOpen, tsqlDot]) and
+                   not (PreviousToken in [tsqlDot]) then
+                  MDBInsert.ExtraValues := MDBInsert.ExtraValues + ' ';
+              end;
+            end;
+            MDBInsert.ExtraValues := TrimRight(MDBInsert.ExtraValues) + ')';
+            if CurrentToken = tsqlBraceClose then GetNextToken;
+          end;
         end;
     else
       UnexpectedToken([tsqlSelect, tsqlValues]);
+    end;
+    if (CurrentToken = tsqlOn) then
+    begin
+      MDBInsert.OnDuplicateKey := 'ON ';
+      GetNextToken;
+      if (CurrentToken = tsqlIdentifier) and SameText(CurrentTokenString, 'DUPLICATE') then
+      begin
+        MDBInsert.OnDuplicateKey := MDBInsert.OnDuplicateKey + 'DUPLICATE ';
+        GetNextToken;
+      end;
+      if (CurrentToken = tsqlKey) then
+      begin
+        MDBInsert.OnDuplicateKey := MDBInsert.OnDuplicateKey + 'KEY ';
+        GetNextToken;
+      end;
+      if (CurrentToken = tsqlUpdate) then
+      begin
+        MDBInsert.OnDuplicateKey := MDBInsert.OnDuplicateKey + 'UPDATE ';
+        GetNextToken;
+      end;
+      while not (CurrentToken in [tsqlEOF, tsqlSemicolon]) do
+      begin
+        if CurrentToken = tsqlString then
+          MDBInsert.OnDuplicateKey := MDBInsert.OnDuplicateKey + '''' + CurrentTokenString + ''''
+        else
+          MDBInsert.OnDuplicateKey := MDBInsert.OnDuplicateKey + CurrentTokenString;
+
+        GetNextToken;
+
+        if not (CurrentToken in [tsqlComma, tsqlBraceClose, tsqlBraceOpen, tsqlDot, tsqlSemicolon]) and
+           not (PreviousToken in [tsqlDot]) then
+          MDBInsert.OnDuplicateKey := MDBInsert.OnDuplicateKey + ' ';
+      end;
     end;
   except
     FreeAndNil(Result);
@@ -4275,6 +4357,12 @@ begin
     GetNextToken;
   if CurrentToken = tsqlEOF then
     Exit(nil);
+  if SameText(CurrentTokenString, 'REPLACE') then
+  begin
+    // Derivamos los REPLACE hacia la función de INSERT
+    Result := ParseInsertStatement(nil);
+  end
+  else
   case CurrentToken of
     tsqlSelect, tsqlWith :
       Result := ParseSelectStatement(nil, []);
@@ -4420,6 +4508,20 @@ end;
 function TSQLParser.IsEndOfLine: Boolean;
 begin
   Result := FScanner.IsEndOfLine;
+end;
+
+{ TSQLMariaDBInsertStatement }
+
+function TSQLMariaDBInsertStatement.GetAsSQL(Options: TSQLFormatOptions;
+                                             AIndent: Integer = 0): TSQLStringType;
+begin
+  Result := inherited GetAsSQL(Options, AIndent);
+  if IsReplace then
+    Result := StringReplace(Result, 'INSERT', 'REPLACE', [rfIgnoreCase]);
+  if ExtraValues <> '' then
+    Result := Result + ExtraValues;
+  if OnDuplicateKey <> '' then
+    Result := Result + sLineBreak + '  ' + Trim(OnDuplicateKey);
 end;
 
 end.
