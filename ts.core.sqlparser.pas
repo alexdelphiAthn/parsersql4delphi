@@ -1927,9 +1927,11 @@ begin
       Expect(tsqlBegin);
       ParseStatementBlock(Result, P.Statements);
     end
-    else if CurrentToken = tsqlBegin then
+    else if (CurrentToken = tsqlBegin) or
+            // SOPORTE MARIADB: bloque etiquetado "label: BEGIN ... END label;"
+            ((CurrentToken = tsqlIdentifier) and (PeekNextToken = tsqlColon)) then
     begin
-      // Estilo MariaDB: captura BEGIN..END como texto formateado
+      // Estilo MariaDB: captura el cuerpo (con etiqueta opcional) como texto
       P.MariaDBBodyText := ParseProcedureBodyAsRaw;
     end
     else
@@ -4601,16 +4603,19 @@ function TSQLParser.ParseProcedureBodyAsRaw: string;
 //  - Indentación estructural (2 espacios por nivel):
 //      Inc tras BEGIN/THEN/ELSE/LOOP/REPEAT/DO; Dec antes de END/ELSE/ELSEIF.
 //  - Saltos de línea estructurales: antes de END/ELSE/ELSEIF, tras
-//    BEGIN/THEN/ELSE/';'.
+//    BEGIN/THEN/ELSE/';', y antes de SELECT/INSERT/UPDATE/DELETE en depth 0.
 //  - Saltos de línea por cláusulas SQL: antes de FROM/WHERE/INTO/SET/VALUES/
-//    GROUP/ORDER/HAVING/LIMIT/JOIN/INNER/LEFT/RIGHT/ON/UNION (en depth 0),
-//    a indent de cláusula (+1 del bloque).
+//    GROUP/ORDER/HAVING/LIMIT/JOIN/INNER/LEFT/RIGHT/ON/UNION (en depth 0,
+//    sólo cuando ya estamos dentro de una sentencia DML), a indent + 1.
+//    Excepción: INTO inmediatamente tras INSERT NO rompe (queda
+//    "INSERT INTO" en la misma línea).
 //  - Saltos antes de AND/OR sólo dentro de WHERE/HAVING/ON.
 //  - Saltos tras ',' (depth 0) sólo dentro de SELECT-fields / SET / VALUES.
+//  - Saltos tras ',' en la lista de columnas de un INSERT (un campo por
+//    línea).
 //  - Espaciado "tight" alrededor de paréntesis, puntos, comas y ';'.
 //  - Sin espacio antes de '(' si el token anterior es identificador,
-//    keyword de función agregada o keyword de tipo (call style: IFNULL(,
-//    SUM(, decimal(, NOW(...)
+//    keyword de función agregada o keyword de tipo (call style).
 //
 // Seguimiento de profundidad: cuenta BEGIN/END pero ignora END seguido de
 // IF/WHILE/CASE/LOOP/REPEAT (cierres de sub-bloques, no del BEGIN exterior).
@@ -4624,34 +4629,45 @@ const
     tsqlFloat, tsqlDate, tsqlTime, tsqlTimeStamp, tsqlBlob,
     tsqlBraceClose, tsqlSquareBraceClose
   ];
+  // Keywords de inicio de sentencia DML (fuerzan salto al depth 0)
+  StmtStartKw : TSQLTokens = [tsqlSelect, tsqlInsert, tsqlUpdate, tsqlDelete];
 var
-  Depth        : Integer;
-  ParenDepth   : Integer;
-  Indent       : Integer;
-  ClauseIndent : Integer;
-  PrevRow      : Integer;
-  CurRow       : Integer;
-  NeedSpace    : Boolean;
-  ForceNewline : Boolean;
-  Done         : Boolean;
-  InStatement  : Boolean;
-  InWhereLike  : Boolean;
-  AllowCommaBreak : Boolean;
-  Upper        : string;
-  PeekTok      : TSQLToken;
-  PeekStr      : string;
+  Depth             : Integer;
+  ParenDepth        : Integer;
+  Indent            : Integer;
+  ClauseIndent      : Integer;
+  PrevRow           : Integer;
+  CurRow            : Integer;
+  NeedSpace         : Boolean;
+  ForceNewline      : Boolean;
+  Done              : Boolean;
+  InStatement       : Boolean;
+  InWhereLike       : Boolean;
+  AllowCommaBreak   : Boolean;
+  PendingInsertInto : Boolean;  // True desde INSERT hasta el INTO siguiente
+  AfterInsertInto   : Boolean;  // True desde INTO (post-INSERT) hasta el '(' de columnas
+  InColumnList      : Boolean;  // estamos dentro de (col1, col2, ...) tras INSERT INTO
+  ColumnListDepth   : Integer;  // ParenDepth al abrir la lista de columnas
+  Upper             : string;
+  PeekTok           : TSQLToken;
+  PeekStr           : string;
 
   function IsClauseKeyword: Boolean;
   begin
-    Result := (ParenDepth = 0) and
-      (SameText(Upper, 'FROM') or SameText(Upper, 'WHERE') or
-       SameText(Upper, 'INTO') or SameText(Upper, 'SET') or
-       SameText(Upper, 'VALUES') or SameText(Upper, 'ORDER') or
-       SameText(Upper, 'GROUP') or SameText(Upper, 'HAVING') or
-       SameText(Upper, 'LIMIT') or SameText(Upper, 'JOIN') or
-       SameText(Upper, 'INNER') or SameText(Upper, 'LEFT') or
-       SameText(Upper, 'RIGHT') or SameText(Upper, 'CROSS') or
-       SameText(Upper, 'ON') or SameText(Upper, 'UNION'));
+    if ParenDepth <> 0 then Exit(False);
+    if not InStatement then Exit(False);
+    // INTO es cláusula sólo en SELECT...INTO; tras INSERT forma parte del
+    // propio "INSERT INTO" y no debe romper.
+    if SameText(Upper, 'INTO') then
+      Exit(not PendingInsertInto);
+    Result := SameText(Upper, 'FROM') or SameText(Upper, 'WHERE') or
+              SameText(Upper, 'SET') or SameText(Upper, 'VALUES') or
+              SameText(Upper, 'ORDER') or SameText(Upper, 'GROUP') or
+              SameText(Upper, 'HAVING') or SameText(Upper, 'LIMIT') or
+              SameText(Upper, 'JOIN') or SameText(Upper, 'INNER') or
+              SameText(Upper, 'LEFT') or SameText(Upper, 'RIGHT') or
+              SameText(Upper, 'CROSS') or SameText(Upper, 'ON') or
+              SameText(Upper, 'UNION');
   end;
 
   function IsAndOrInWhere: Boolean;
@@ -4674,7 +4690,7 @@ var
     end
     else if NeedSpace then
     begin
-      if not (CurrentToken in [tsqlComma, tsqlSemicolon, tsqlDot,
+      if not (CurrentToken in [tsqlComma, tsqlSemicolon, tsqlDot, tsqlColon,
                                tsqlBraceClose, tsqlSquareBraceClose]) then
       begin
         // Sin espacio antes de '(' si previo es identifier-like (función)
@@ -4707,6 +4723,10 @@ begin
   InStatement := False;
   InWhereLike := False;
   AllowCommaBreak := False;
+  PendingInsertInto := False;
+  AfterInsertInto := False;
+  InColumnList := False;
+  ColumnListDepth := 0;
 
   while (not Done) and (CurrentToken <> tsqlEOF) do
   begin
@@ -4739,6 +4759,14 @@ begin
     if CurrentToken = tsqlBraceOpen then
       Inc(ParenDepth);
 
+    // Pre-emit: forzar salto antes de SELECT/INSERT/UPDATE/DELETE en depth 0
+    // (cubre INSERT...SELECT en la misma línea: el SELECT pasa a su propia línea).
+    if (CurrentToken in StmtStartKw) and (ParenDepth = 0) then
+    begin
+      ForceNewline := True;
+      ClauseIndent := 0;
+    end;
+
     // Saltos por cláusula SQL / AND-OR en WHERE-like
     if IsClauseKeyword or IsAndOrInWhere then
     begin
@@ -4755,16 +4783,36 @@ begin
       InStatement := False;
       InWhereLike := False;
       AllowCommaBreak := False;
+      PendingInsertInto := False;
+      AfterInsertInto := False;
+      InColumnList := False;
       if Indent > 0 then
         Dec(Indent);
     end;
 
     AppendCurrent(CurRow);
 
-    // ParenDepth: decrement DESPUÉS de emitir ')'
+    // ParenDepth: tras emitir ')' detecta cierre de lista de columnas y decrementa
     if CurrentToken = tsqlBraceClose then
+    begin
+      if InColumnList and (ParenDepth = ColumnListDepth) then
+        InColumnList := False;
       if ParenDepth > 0 then
         Dec(ParenDepth);
+    end;
+
+    // Tras emitir '(': si esperábamos la lista de columnas de un INSERT, entramos
+    if (CurrentToken = tsqlBraceOpen) and AfterInsertInto then
+    begin
+      InColumnList := True;
+      ColumnListDepth := ParenDepth;  // ya está incrementado
+      AfterInsertInto := False;
+    end
+    else if (CurrentToken = tsqlBraceOpen) then
+    begin
+      // Cualquier otro '(' después de INSERT INTO también invalida la espera
+      // (raro: INSERT INTO sin nombre de tabla). No hacemos nada extra.
+    end;
 
     // Inc Indent tras BEGIN / THEN / ELSE / LOOP / REPEAT / DO
     if (CurrentToken = tsqlBegin) or SameText(Upper, 'THEN') or
@@ -4773,12 +4821,19 @@ begin
       Inc(Indent);
 
     // Detección de inicio de sentencia SQL
-    if (CurrentToken = tsqlSelect) or (CurrentToken = tsqlUpdate) or
-       (CurrentToken = tsqlInsert) or (CurrentToken = tsqlDelete) then
+    if CurrentToken in StmtStartKw then
     begin
       InStatement := True;
       // SELECT permite romper su lista de campos por ','
       AllowCommaBreak := (CurrentToken = tsqlSelect);
+    end;
+    if CurrentToken = tsqlInsert then
+      PendingInsertInto := True;
+    if (CurrentToken = tsqlInto) then
+    begin
+      if PendingInsertInto then
+        AfterInsertInto := True;
+      PendingInsertInto := False;
     end;
 
     // Tracking de la cláusula actual para AND/OR breaks y comma breaks
@@ -4787,7 +4842,17 @@ begin
       InWhereLike := True;
       AllowCommaBreak := False;
     end
-    else if SameText(Upper, 'SET') or SameText(Upper, 'VALUES') then
+    else if SameText(Upper, 'SET') then
+    begin
+      // SET sólo cuenta como cláusula si estamos dentro de un UPDATE.
+      // SET de asignación top-level (SET var = expr;) no debe romper.
+      if InStatement then
+      begin
+        InWhereLike := False;
+        AllowCommaBreak := True;
+      end;
+    end
+    else if SameText(Upper, 'VALUES') then
     begin
       InWhereLike := False;
       AllowCommaBreak := True;
@@ -4817,6 +4882,9 @@ begin
       InStatement := False;
       InWhereLike := False;
       AllowCommaBreak := False;
+      PendingInsertInto := False;
+      AfterInsertInto := False;
+      InColumnList := False;
     end;
 
     // Tras ',' en depth 0 dentro de SELECT/SET/VALUES: forzar salto
@@ -4827,6 +4895,31 @@ begin
       ClauseIndent := 1;
     end;
 
+    // Tras ',' en la lista de columnas de INSERT INTO t(...): un campo por línea
+    // (la ',' queda pegada al identificador anterior, el siguiente campo en
+    // nueva línea).
+    if (CurrentToken = tsqlComma) and InColumnList and
+       (ParenDepth = ColumnListDepth) then
+    begin
+      ForceNewline := True;
+      ClauseIndent := 1;
+    end;
+
+    GetNextToken;
+  end;
+
+  // SOPORTE MARIADB: tras el END del bloque etiquetado puede venir el label
+  // de cierre ("END PRC;"). Lo emitimos en la misma línea que END antes de
+  // dejar el control al outer Parse (que espera ';' o EOF).
+  // OJO: NO consumir si el identifier es un marcador '$$' del cliente MySQL
+  // ni la directiva DELIMITER siguiente; ambos los gestiona el outer Parse
+  // como "ruido" al inicio de la siguiente sentencia.
+  if (CurrentToken = tsqlIdentifier) and
+     (CurrentTokenString <> '') and
+     (CurrentTokenString[1] <> '$') and
+     not SameText(CurrentTokenString, 'DELIMITER') then
+  begin
+    AppendCurrent(FScanner.CurRow);
     GetNextToken;
   end;
 end;
@@ -4903,7 +4996,30 @@ begin
     tsqlCommit :
       Result := ParseCommitStatement(nil);
     tsqlExecute :
-      Result := ParseExecuteProcedureStatement(nil);
+      begin
+        // EXECUTE PROCEDURE name (Firebird) vs EXECUTE stmt (MariaDB
+        // prepared statement). Si tras EXECUTE viene PROCEDURE, llamada
+        // a stored procedure; en otro caso lo tratamos como sentencia
+        // cruda hasta el ';' (sintaxis de prepared statements MySQL).
+        if PeekNextToken = tsqlProcedure then
+          Result := ParseExecuteProcedureStatement(nil)
+        else
+        begin
+          Result := TSQLRawStatement(CreateElement(TSQLRawStatement, nil));
+          TSQLRawStatement(Result).RawText := CurrentTokenString;
+          GetNextToken;
+          while not (CurrentToken in [tsqlEOF, tsqlSemicolon]) do
+          begin
+            if CurrentToken = tsqlString then
+              TSQLRawStatement(Result).RawText :=
+                TSQLRawStatement(Result).RawText + ' ''' + CurrentTokenString + ''''
+            else
+              TSQLRawStatement(Result).RawText :=
+                TSQLRawStatement(Result).RawText + ' ' + CurrentTokenString;
+            GetNextToken;
+          end;
+        end;
+      end;
     tsqlConnect :
       Result := ParseConnectStatement(nil);
     tsqlDeclare :
@@ -4960,8 +5076,17 @@ begin
   else
     UnexpectedToken;
   end;
+  // Aceptamos también como terminador válido los marcadores '$$' del cliente
+  // MySQL y la palabra DELIMITER: cuando un PROCEDURE acaba "END $$\nDELIMITER ;"
+  // el body parser deja CurrentToken en '$$', y la siguiente llamada a
+  // Parse() los gestionará como "ruido" inicial.
   if Not(CurrentToken in [tsqlEOF, tsqlSemicolon]) then
   begin
+    if (CurrentToken = tsqlIdentifier) and
+       ((CurrentTokenString <> '') and
+        ((CurrentTokenString[1] = '$') or
+         SameText(CurrentTokenString, 'DELIMITER'))) then
+      Exit;
     FreeAndNil(Result);
     if (CurrentToken = tsqlBraceClose) then
       Error(SerrUnmatchedBrace);
