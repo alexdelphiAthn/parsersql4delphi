@@ -523,8 +523,16 @@ begin
   if FKeyWords.Count > 0 then
     FKeyWords.Clear;
   for I := FirstKeyword to LastKeyWord do
+  begin
+    // --- SOPORTE MARIADB: palabras reservadas comúnmente usadas como alias ---
+    // No registrar como keyword para que el scanner las trate como identificadores.
+    // 'AT' aparece típicamente como alias (ej: "select at.* from articulos_tarifas at")
+    // y solo se usaba en sintaxis Firebird "STARTING AT page-number" que MariaDB no soporta.
+    if I = tsqlAt then
+      Continue;
     if (not Assigned(FExclude)) or (FExclude.IndexOf(TokenInfos[I]) = -1) then
       FKeyWords.Add(UpperCase(TokenInfos[I]), I);
+  end;
 end;
 
 {function TSQLScanner.DoStringLiteral: TSQLToken;
@@ -1033,7 +1041,8 @@ function TSQLScanner.DoIdentifier : TSQLToken;
           end;
           'a' .. 'z',
           'A' .. 'Z',
-          '@':
+          '@',
+          '$':  // SOPORTE MARIADB: '$$' como marcador de DELIMITER
           Result := DoIdentifier;
       else
         if Ord(TokenStr[0]) > 127 then
@@ -1045,6 +1054,15 @@ function TSQLScanner.DoIdentifier : TSQLToken;
       ((Result = tsqlComment) and (soReturnComments in Options)) or
       ((Result = tsqlWhiteSpace) and (soReturnWhiteSpace in Options));
     FCurToken := Result;
+
+    // --- INICIO CORRECCIÓN ---
+    // Si el token es un símbolo u operador (paréntesis, punto, coma, math) y
+    // la cadena de texto está vacía, la rellenamos con su texto real.
+    // Esto evita que las extracciones de texto bruto "se coman" los símbolos.
+    if (FCurTokenString = '') and (Result >= tsqlBraceOpen) and (Result <= tsqlNE) then
+      FCurTokenString := TokenInfos[Result];
+    // --- FIN CORRECCIÓN ---
+
   end;
 
   function TSQLScanner.IsEndOfLine: Boolean;
