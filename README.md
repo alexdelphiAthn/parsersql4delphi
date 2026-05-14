@@ -1,5 +1,5 @@
 # parsersql4delphi
-Formateador de MySQL para delphi nativo, incluye consultas, ddl, vistas y procedimientos almacenados
+Formateador de MySQL para delphi nativo, incluye SELECT, UPDATE, INSERT, DELETE... DDL, VIEWS AND STORED PROCEDURES
 ```pascal
 //Ejemplo
 function FormatearSQL(sSQL:string):string;
@@ -9,4 +9,4 @@ begin
   Formatter := GetSQLFormatter;
   Result := Formatter.Format(sSQL);
 end;
-```pascal
+
