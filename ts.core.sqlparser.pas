@@ -1,17 +1,51 @@
 ﻿{
   Copyright (C) 2013-2023 Tim Sinaeve tim.sinaeve@gmail.com
+  Copyright (C) 2026 Alejandro Laorden Hidalgo alejandro.laorden@proton.me
 
-  Licensed under the Apache License, Version 2.0 (the "License");
-  you may not use this file except in compliance with the License.
-  You may obtain a copy of the License at
+  Este archivo deriva originalmente de código de Tim Sinaeve, publicado bajo
+  la Apache License, Version 2.0, y ha sido modificado de forma sustancial.
 
-      http://www.apache.org/licenses/LICENSE-2.0
+  DOBLE LICENCIA / DUAL LICENSE
+  ---------------------------------------------------------------------------
+  - El código original de Tim Sinaeve permanece bajo la Apache License,
+    Version 2.0 (texto al final de esta cabecera).
+  - Las modificaciones y nuevas aportaciones de Alejandro Laorden Hidalgo se
+    publican bajo la MIT License (texto a continuación).
 
-  Unless required by applicable law or agreed to in writing, software
-  distributed under the License is distributed on an "AS IS" BASIS,
-  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-  See the License for the specific language governing permissions and
-  limitations under the License.
+  MIT License (modificaciones de Alejandro Laorden Hidalgo):
+
+      Permission is hereby granted, free of charge, to any person obtaining a
+      copy of this software and associated documentation files (the
+      "Software"), to deal in the Software without restriction, including
+      without limitation the rights to use, copy, modify, merge, publish,
+      distribute, sublicense, and/or sell copies of the Software, and to
+      permit persons to whom the Software is furnished to do so, subject to
+      the following conditions:
+
+      The above copyright notice and this permission notice shall be included
+      in all copies or substantial portions of the Software.
+
+      THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+      OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+      MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+      IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+      CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+      TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+      SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+  Apache License, Version 2.0 (código original de Tim Sinaeve):
+
+      Licensed under the Apache License, Version 2.0 (the "License");
+      you may not use this file except in compliance with the License.
+      You may obtain a copy of the License at
+
+          http://www.apache.org/licenses/LICENSE-2.0
+
+      Unless required by applicable law or agreed to in writing, software
+      distributed under the License is distributed on an "AS IS" BASIS,
+      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+      See the License for the specific language governing permissions and
+      limitations under the License.
 }
 // Codigo third-party - suprimir warnings/hints sin modificar fuentes externas.
 {$WARN NO_RETVAL OFF}
@@ -244,6 +278,40 @@ type
       : TSQLConnectStatement;
     function ParseGrantStatement(AParent: TSQLElement): TSQLGrantStatement;
     function ParseRevokeStatement(AParent: TSQLElement): TSQLGrantStatement;
+    // =====================================================================
+    //  Sentencias y variantes MySQL/MariaDB aceptadas (Parse / ParseScript)
+    // =====================================================================
+    //  El parser deriva del dialecto Firebird/InterBase original y se ha
+    //  extendido para aceptar MySQL/MariaDB. En un script (sentencias
+    //  separadas por ';' o por bloques DELIMITER ... $$) reconoce:
+    //
+    //   * DML
+    //       SELECT  - CTE (WITH), UNION, JOINs, subconsultas, GROUP BY,
+    //                 HAVING, ORDER BY y LIMIT
+    //       INSERT  - incluye REPLACE, INSERT IGNORE y VALUES múltiples
+    //       UPDATE
+    //       DELETE
+    //
+    //   * DDL: CREATE / ALTER / DROP de
+    //       TABLE     - AUTO_INCREMENT, DEFAULT, NOT NULL, COMMENT,
+    //                   constraints y claves foráneas
+    //       VIEW      - admite CREATE OR REPLACE y ALGORITHM / DEFINER /
+    //                   SQL SECURITY
+    //       PROCEDURE - cuerpo BEGIN..END, bloques etiquetados, IN/OUT/INOUT
+    //       TRIGGER, INDEX (UNIQUE/ASC/DESC), DATABASE/SCHEMA, DOMAIN,
+    //       EXCEPTION, GENERATOR, ROLE, SHADOW
+    //
+    //   * Transacciones / sesión
+    //       SET, COMMIT, ROLLBACK, START TRANSACTION, CONNECT
+    //
+    //   * Procedural / permisos / otros
+    //       DECLARE (variables y funciones)
+    //       EXECUTE PROCEDURE (Firebird)
+    //       PREPARE / EXECUTE / DEALLOCATE (prepared statements MySQL,
+    //         conservadas como texto crudo)
+    //       GRANT / REVOKE (tabla, rol y execute)
+    //       Bloques DELIMITER ... del cliente MySQL/MariaDB (p. ej. '$$')
+    // =====================================================================
     function Parse : TSQLElement;
     function ParseScript(AllowPartial : Boolean = False) : TSQLelementList;
     // Auxiliary stuff
