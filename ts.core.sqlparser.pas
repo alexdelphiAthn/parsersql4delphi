@@ -13,6 +13,10 @@
   See the License for the specific language governing permissions and
   limitations under the License.
 }
+// Codigo third-party - suprimir warnings/hints sin modificar fuentes externas.
+{$WARN NO_RETVAL OFF}
+{$WARN USE_BEFORE_DEF OFF}
+{$HINTS OFF}
 unit ts.Core.SQLParser;
 
 //{$MODE DELPHI}
@@ -178,6 +182,10 @@ type
     // SELECT parsing
     function ParseExprAggregate(AParent: TSQLElement; EO: TExpressionOptions)
       : TSQLAggregateFunctionExpression;
+    function ParseOverClause(AParent: TSQLElement; AFunc: TSQLExpression)
+      : TSQLWindowFunctionExpression;
+    function ParseRawFunctionCall(AParent: TSQLElement; const AName: string)
+      : TSQLExpression;
     procedure ParseFromClause(AParent: TSQLSelectStatement;
       AList: TSQLelementList);
     procedure ParseGroupBy(AParent: TSQLSelectStatement;
@@ -2989,6 +2997,101 @@ begin
   end;
 end;
 
+function TSQLParser.ParseOverClause(AParent : TSQLElement;
+  AFunc : TSQLExpression) : TSQLWindowFunctionExpression;
+var
+  O : TSQLOrderByElement;
+begin
+  // Al entrar estamos en el identificador OVER. AFunc es la llamada a
+  // funcion / agregado sobre la que actua la clausula ventana.
+  Result := TSQLWindowFunctionExpression
+    (CreateElement(TSQLWindowFunctionExpression, AParent));
+  try
+    Result.FunctionExpr := AFunc;
+    GetNextToken;
+    Consume(tsqlBraceOpen);
+    // PARTITION BY (opcional)
+    if (CurrentToken = tsqlIdentifier) and
+       SameText(CurrentTokenString, 'PARTITION') then
+    begin
+      GetNextToken;
+      Expect(tsqlBy);
+      Repeat
+        GetNextToken;
+        Result.PartitionBy.Add(ParseExprLevel1(Result, []));
+      until (CurrentToken <> tsqlComma);
+    end;
+    // ORDER BY (opcional)
+    if (CurrentToken = tsqlOrder) then
+    begin
+      GetNextToken;
+      Expect(tsqlBy);
+      Repeat
+        GetNextToken;
+        O := TSQLOrderByElement(CreateElement(TSQLOrderByElement, Result));
+        Result.OrderBy.Add(O);
+        O.Field := ParseExprLevel1(O, []);
+        if (CurrentToken in [tsqlDesc, tsqlAsc, tsqlDescending,
+          tsqlAscending]) then
+        begin
+          if (CurrentToken in [tsqlDesc, tsqlDescending]) then
+            O.OrderBy := obDescending
+          else
+            O.OrderBy := obAscending;
+          GetNextToken;
+        end;
+      until (CurrentToken <> tsqlComma);
+    end;
+    Consume(tsqlBraceClose);
+  except
+    // El caller sigue siendo dueño de AFunc; evitamos el doble free
+    Result.FunctionExpr := nil;
+    FreeAndNil(Result);
+    raise;
+  end;
+end;
+
+function TSQLParser.ParseRawFunctionCall(AParent : TSQLElement;
+  const AName : string) : TSQLExpression;
+var
+  N : string;
+  PCount : Integer;
+begin
+  // Captura cruda del contenido de funciones MySQL con sintaxis no estandar
+  // (GROUP_CONCAT, TRIM ... FROM ...). Reproduce el texto tal cual, ya que el
+  // arbol no modela estas variantes. Al entrar estamos en el '(' inicial.
+  N := AName + '(';
+  PCount := 1;
+  GetNextToken;
+  while (PCount > 0) and (CurrentToken <> tsqlEOF) do
+  begin
+    if CurrentToken = tsqlBraceOpen then
+      Inc(PCount)
+    else if CurrentToken = tsqlBraceClose then
+      Dec(PCount);
+    if PCount > 0 then
+    begin
+      // No separar el '(' del token previo ni romper rutas tabla.campo
+      if (N[Length(N)] <> '(') and
+         (CurrentToken <> tsqlDot) and
+         (CurrentToken <> tsqlBraceOpen) and
+         (PreviousToken <> tsqlDot) then
+        N := N + ' ';
+      if CurrentToken = tsqlString then
+        N := N + '''' + CurrentTokenString + ''''
+      else
+        N := N + CurrentTokenString;
+      GetNextToken;
+    end;
+  end;
+  N := N + ')';
+  if CurrentToken = tsqlBraceClose then
+    GetNextToken;
+  Result := TSQLIdentifierExpression
+    (CreateElement(TSQLIdentifierExpression, AParent));
+  TSQLIdentifierExpression(Result).Identifier := CreateIdentifier(Result, N);
+end;
+
 function TSQLParser.ParseExprPrimitive(AParent : TSQLElement;
   EO : TExpressionOptions) : TSQLExpression;
 var
@@ -2997,7 +3100,6 @@ var
   C : TSQLElementClass;
   E : TSQLExtractElement;
   WhenNode: TSQLCaseWhenNode;
-  PCount: Integer;
 begin
   Result := nil;
   try
@@ -3157,7 +3259,10 @@ begin
             CreateIdentifier(Result, N);
           Consume(tsqlIdentifier);
         end;
-      tsqlIdentifier, tsqlIf:
+      // tsqlLeft / tsqlRight son palabras reservadas (LEFT/RIGHT JOIN) pero
+      // tambien funciones de cadena MySQL LEFT(str,n) / RIGHT(str,n). En una
+      // expresion solo pueden ser la funcion, asi que las tratamos como tal.
+      tsqlIdentifier, tsqlIf, tsqlLeft, tsqlRight:
         begin
           if CurrentToken = tsqlIf then
             N := 'IF'
@@ -3196,34 +3301,8 @@ begin
           end
           else
           begin
-            if SameText(N, 'GROUP_CONCAT') then
-            begin
-              N := N + '(';
-              PCount := 1;
-              GetNextToken;
-              while (PCount > 0) and (CurrentToken <> tsqlEOF) do
-              begin
-                if CurrentToken = tsqlBraceOpen then Inc(PCount)
-                else if CurrentToken = tsqlBraceClose then Dec(PCount);
-                if PCount > 0 then
-                begin
-                  if (N[Length(N)] <> '(') and
-                     (CurrentToken <> tsqlDot) and
-                     (PreviousToken <> tsqlDot) then
-                    N := N + ' ';
-                  if CurrentToken = tsqlString then
-                    N := N + '''' + CurrentTokenString + ''''
-                  else
-                    N := N + CurrentTokenString;
-                  GetNextToken;
-                end;
-              end;
-              N := N + ')';
-              if CurrentToken = tsqlBraceClose then
-                GetNextToken;
-              Result := TSQLIdentifierExpression(CreateElement(TSQLIdentifierExpression, AParent));
-              TSQLIdentifierExpression(Result).Identifier := CreateIdentifier(Result, N);
-            end
+            if SameText(N, 'GROUP_CONCAT') or SameText(N, 'TRIM') then
+              Result := ParseRawFunctionCall(AParent, N)
             else
             begin
               L := ParseValueList(AParent, EO);
@@ -3238,6 +3317,12 @@ begin
     else
       UnexpectedToken;
     end;
+    // Funcion ventana: detectamos OVER tras una llamada a funcion o agregado
+    if (CurrentToken = tsqlIdentifier) and
+       SameText(CurrentTokenString, 'OVER') and
+       ((Result is TSQLFunctionCallExpression) or
+        (Result is TSQLAggregateFunctionExpression)) then
+      Result := ParseOverClause(AParent, Result);
   except
     FreeAndNil(Result);
     raise;
